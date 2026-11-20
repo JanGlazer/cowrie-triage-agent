@@ -13,6 +13,10 @@ Target: a small Linux VPS (2 GB RAM is enough), Docker, Python 3.11+.
    `cp .env.example .env && chmod 600 .env`, add the key, then `agent.py check`,
    `agent.py analyze --dry-run`, `agent.py analyze --limit 1`.
 
+Your own test logins: list your home IPs (or CIDR, if your ISP rotates addresses) in
+`data/self_ips.txt`, one per line. That directory is git-ignored. Those sessions are labelled
+`self_test` and never reach the tier 2 queue or `seen_keys`. Run `triage.py --rebuild` after editing it.
+
 Upgrades are additive: `schema.sql` uses `CREATE TABLE IF NOT EXISTS` and the loader migrates old
 databases. Back up `data/cowrie.db` under the loader lock before an upgrade:
 `flock /tmp/cowrie-loader.lock cp data/cowrie.db data/cowrie.db.bak`.

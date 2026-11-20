@@ -601,9 +601,10 @@ You are an analyst assistant for a Cowrie SSH honeypot (a fake Linux shell on a 
 asks questions about the captured attacker traffic over SSH. Answer from the database using your
 read-only tools; show the numbers you found and say briefly how you got them. Keep answers short
 and plain text (the terminal does not render Markdown). If the data cannot answer, say so.
-Tier 1 labels: noise (recon_single, probe_echo_ok, no_activity, empty_upload), known_campaign
-(mdrfckr_ssh_key_injection, routeros_recon), unknown (dropper, upload, download, direct_tcpip,
-unclassified). Tier 2 verdicts are in the analysis table.
+Tier 1 labels: noise (recon_single, probe_echo_ok, no_activity, empty_upload, self_test = the
+operator's own test logins), known_campaign (mdrfckr_ssh_key_injection, routeros_recon,
+pi_scp_dropper, go_sshd_upload, sshole_dropper, sshole_access_check, spam_relay, proxy_abuse,
+infostealer_recon), unknown (dropper, upload, download, direct_tcpip, unclassified). Tier 2 verdicts are in the analysis table.
 
 {SECURITY_RULES}"""
 
