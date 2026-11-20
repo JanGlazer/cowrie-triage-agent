@@ -1,0 +1,6 @@
+# crontab -e  (as the unprivileged user that owns ~/honeypot-agent)
+# flock keeps loader runs from overlapping; triage runs inside the loader, under the same lock.
+*/5 * * * * cd ~/honeypot-agent && flock -n /tmp/cowrie-loader.lock python3 loader.py >> data/loader.log 2>&1
+# Retention (rotated logs older than 30 days AND fully ingested) and low-disk Telegram alert.
+17 * * * * cd ~/honeypot-agent && python3 housekeeping.py >> data/housekeeping.log 2>&1
+# The tier 2 agent is run by hand for now (agent.py analyze); no cron line yet.
